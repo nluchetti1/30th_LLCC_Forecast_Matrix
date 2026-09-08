@@ -91,8 +91,17 @@ jobs:
       # source produced nothing -- the IVT models were abandoned on three separate successful
       # runs and the log explaining why was thrown away each time, because the pipeline
       # degrades rather than crashing. Partial failure is the interesting case.
+      # continue-on-error, and `if: always()` on the push below.
+      #
+      # WHY: on 2026-09-08 this step failed at FinalizeArtifact with a non-retryable 403 AFTER
+      # the bytes had uploaded successfully. Because "Commit and Push" had no `if:` condition,
+      # a failure here SKIPPED it -- the pipeline had already run to completion and built the
+      # dashboard, and then the result was thrown away because a diagnostic upload could not
+      # be finalised. The log artifact is a convenience; the commit is the product. A flaky
+      # artifact service must never be able to block it again.
       - name: Upload run log
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: run-log-${{ github.run_number }}
@@ -100,6 +109,11 @@ jobs:
           retention-days: 14
 
       - name: Commit and Push
+        # always(): the dashboard is worth publishing even if a diagnostic step above failed.
+        # This does NOT publish a broken run -- "Run Script" uses `set -o pipefail`, so a
+        # crashed pipeline writes no new outputs and the `git diff --staged --quiet` check
+        # below then exits cleanly with "No changes to commit."
+        if: always()
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
