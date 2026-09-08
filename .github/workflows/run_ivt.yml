@@ -1,0 +1,117 @@
+name: Update IVT Maps (Vandenberg)
+
+# Split out of run_dashboard.yml. The IVT block added ~11 minutes to a pipeline already
+# running 43, which pushed scheduled runs past that workflow's timeout-minutes: 60 -- they
+# were killed at 1h00m and reported as "cancelled" with no error text, while a manual run
+# that happened to finish in 51m succeeded.
+#
+# Every 3 hours rather than hourly, because the models do not update faster than that:
+# GFS and NAM are 6-hourly, ECMWF 12-hourly. RAP is hourly, so its maps will lag by up to
+# 3 hours -- move to '40 * * * *' if that matters more than the Actions minutes.
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Comma-separated subset (blank = all enabled)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# Its own group, independent of taf-dashboard-update, so the two workflows never block each
+# other. They write disjoint paths (maps/ivt + ivt_maps.json here; index.html + history.json
+# there), so the rebase in both push steps merges cleanly.
+concurrency:
+  group: ivt-maps-update-vbg
+  cancel-in-progress: false
+
+jobs:
+  update-ivt:
+    runs-on: ubuntu-latest
+    # A full set was ~11 minutes on the Cape build. EXPECT LONGER HERE: GFS and ECMWF now
+    # cover a 47x37 degree Pacific box instead of 40x30, which is ~1.45x the grid per step
+    # and therefore ~1.45x the GFS download. RAP and NAM are unchanged (they use the smaller
+    # IVT_DOMAIN_CONUS). 40 minutes still leaves real headroom, but if scheduled runs start
+    # reporting "cancelled" with no error text, this is the first number to raise -- that is
+    # exactly how the timeout failure presented when IVT was still inside run_dashboard.yml.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update --fix-missing
+          # libaec-dev provides CCSDS (AEC) decompression. ECMWF Open Data GRIB2 has been
+          # CCSDS-packed since July 2023; without it pygrib opens the file and decodes zero
+          # fields, which looks like "no levels published" rather than a missing codec.
+          sudo apt-get install -y libeccodes-dev libaec-dev libgeos-dev libproj-dev proj-bin
+
+      - name: Install Libraries
+        run: |
+          pip install -r requirements.txt
+          pip install ecmwf-opendata
+
+      - name: Run IVT map build
+        run: |
+          set -o pipefail
+          python ivt_maps.py --models "${{ github.event.inputs.models }}" 2>&1 | tee ivt.log
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "--- IVT summary ---"
+          grep -E "\[IVT\]" ivt.log | tail -40 || echo "(no IVT lines)"
+          echo "--- errors ---"
+          grep -E "ERROR|Traceback" ivt.log | head -20 || echo "(none)"
+          echo "--- output ---"
+          ls -la ivt_maps.json 2>/dev/null || echo "ivt_maps.json missing"
+          for d in maps/ivt/*/; do
+            [ -d "$d" ] && echo "$d: $(ls "$d" | wc -l) file(s)"
+          done
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ivt-log-${{ github.run_number }}
+          path: ivt.log
+          retention-days: 14
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+          # `git add maps/ivt/` also stages DELETIONS, so PNGs that prune_ivt_maps() removed
+          # are dropped from the repo too. Without that the maps directory grows without
+          # bound -- RAP alone writes 22 new files an hour.
+          if [ -e ivt_maps.json ]; then git add ivt_maps.json; fi
+          if [ -d maps/ivt ]; then git add maps/ivt/; fi
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update IVT maps $(date -u)"
+
+          # The dashboard workflow pushes to the same branch. Different paths, so the rebase
+          # merges -- but a lost race should not fail the job.
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying in 10s."
+            sleep 10
+          done
+          echo "All push attempts failed."
+          exit 1
