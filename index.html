@@ -58,7 +58,9 @@
            Deliberately understated — the value is still a real forecast, just an older one. */
         .cell-stale { border-bottom: 3px double #94a3b8 !important; }
         /* A column served from mandatory-level GRIB because no BUFKIT sounding was available.
-           Distinct from .cell-stale: the data is CURRENT, just vertically coarser. */
+           Distinct from .cell-stale: the data is CURRENT, just vertically coarser.
+           .cell-stale means the value is old; .cell-coarse means the value is fresh but the
+           profile behind it is thin. Both are degraded states, neither is preferable. */
         .cell-coarse { border-bottom: 2px dotted #a78bfa !important; }
         .cell-stale::after { content: "*"; position: absolute; top: 0px; right: 3px; font-size: 0.62rem; color: #64748b; font-weight: bold; line-height: 1; }
 
@@ -622,7 +624,7 @@
                                    + (profile.coarse ? " cell-coarse" : "");
                     const staleTitle = profile.stale
                         ? ` title="Carried forward from ${profile.stale} — BUFKIT fetch failed this run"`
-                        : (profile.coarse ? ` title="${profile.coarse} — mandatory isobaric levels, so shear is a bulk estimate"` : "");
+                        : (profile.coarse ? ` title="${profile.coarse} — no BUFKIT sounding for this station/model this run; mandatory isobaric levels, so shear is a bulk estimate"` : "");
 
                     tr.innerHTML += `<td id="${cellId}" class="${props.cls}${staleCls}"${staleTitle} style="cursor:help;">${props.txt}</td>`;
 
@@ -888,7 +890,7 @@
                     <div class="legend-item cell-shear-40"><span>Strong Shear</span><span>≥ 40 kt Magnitude</span></div>
                     
                     <div class="explanation-box">
-                        <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>dotted violet underline</strong> is served from mandatory-level GRIB rather than a BUFKIT sounding. PSU closed public access to its BUFKIT archive in August 2026, so the airport HRRR column now falls back to the same AWS isobaric data the pads use. The values are current; they're just vertically coarser, which matters most for wind shear.</em></span>
+                        <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>dotted violet underline</strong> is served from mandatory-level GRIB rather than a BUFKIT sounding, because <strong>no BUFKIT sounding was available for that station and model on this run</strong>. The fallback is decided per station, per model, per run &mdash; it says nothing about whether the PSU archive as a whole is reachable, and one violet column alongside healthy BUFKIT columns elsewhere is normal and usually means that <em>station</em> is not carried on that model's BUFKIT list (or is filed under a different id). The values are current, but vertically coarser: mandatory levels give ~20&ndash;25 evenly spaced points instead of ~40 packed into the boundary layer, so low-level shear, jet-nose winds and thin cloud layers are the first things to degrade. Treat max-momentum-layer wind on a violet cell as biased low. Coarser is a <strong>downgrade</strong>, not a feature &mdash; it is simply better than the blank column it replaces.</em></span>
                         <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>double underline and an asterisk*</strong> was carried forward from an earlier run: PSU's BUFKIT server throttled the fetch, so the last good column is shown rather than a blank one. It is a real forecast, just an older cycle — hover for the run it came from. Only the BUFKIT columns (GFS/RAP/HRRR at airports) can go stale this way; RRFS, REFS, ECMWF and the pads come from AWS/ECMWF and are unaffected.</em></span>
                         <strong>Aviation Parameter Definitions &amp; Methodology:</strong><br><br>
                         • <strong>PBL Mom Mean:</strong> The mean wind through the mixed layer (mean layer wind), using the BUFKIT momentum-transfer technique to define the mixed-layer depth.<br><br>
@@ -917,7 +919,7 @@
                     <div class="legend-item ltg-high"><span>-20°C Breach</span><span>Cloud Top ≥ -20°C</span></div>
 
                     <div class="explanation-box">
-                        <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>dotted violet underline</strong> is served from mandatory-level GRIB rather than a BUFKIT sounding. PSU closed public access to its BUFKIT archive in August 2026, so the airport HRRR column now falls back to the same AWS isobaric data the pads use. The values are current; they're just vertically coarser, which matters most for wind shear.</em></span>
+                        <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>dotted violet underline</strong> is served from mandatory-level GRIB rather than a BUFKIT sounding, because <strong>no BUFKIT sounding was available for that station and model on this run</strong>. The fallback is decided per station, per model, per run &mdash; it says nothing about whether the PSU archive as a whole is reachable, and one violet column alongside healthy BUFKIT columns elsewhere is normal and usually means that <em>station</em> is not carried on that model's BUFKIT list (or is filed under a different id). The values are current, but vertically coarser: mandatory levels give ~20&ndash;25 evenly spaced points instead of ~40 packed into the boundary layer, so low-level shear, jet-nose winds and thin cloud layers are the first things to degrade. Treat max-momentum-layer wind on a violet cell as biased low. Coarser is a <strong>downgrade</strong>, not a feature &mdash; it is simply better than the blank column it replaces.</em></span>
                         <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>double underline and an asterisk*</strong> was carried forward from an earlier run: PSU's BUFKIT server throttled the fetch, so the last good column is shown rather than a blank one. It is a real forecast, just an older cycle — hover for the run it came from. Only the BUFKIT columns (GFS/RAP/HRRR at airports) can go stale this way; RRFS, REFS, ECMWF and the pads come from AWS/ECMWF and are unaffected.</em></span>
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
                         • <strong>Isotherm Profiles (+5/0/-5/-10/-15/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
@@ -943,9 +945,12 @@
                      RRFS/REFS/ECMWF in the same row are current.</div>`
                 : (p.coarse
                 ? `<div style="margin-bottom:6px; padding:4px 6px; background:#ede9fe; color:#4c1d95; border-radius:3px; font-size:0.75rem;">
-                     <strong>${p.coarse}</strong> — current data, but on mandatory isobaric levels rather than a
-                     ~40-level BUFKIT sounding. Vertical resolution is coarser, which matters most for
-                     low-level shear and thin cloud layers.</div>`
+                     <strong>${p.coarse}</strong> — no BUFKIT sounding was available for this station and
+                     model this run, so the column falls back to mandatory isobaric levels. The data is
+                     current, but vertically coarse: ~20–25 evenly spaced levels instead of ~40 packed
+                     into the boundary layer. Low-level shear, the max-momentum-layer wind and thin cloud
+                     layers degrade first — if mean and max boundary wind are nearly equal, that is the
+                     profile being too sparse to resolve a maximum, not a calm layer.</div>`
                 : "");
             if (isAviation) {
                 let shearVal = parseFloat(p.shear);
