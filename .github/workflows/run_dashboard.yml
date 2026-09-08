@@ -1,0 +1,140 @@
+name: Update TAF Dashboard (Vandenberg)
+on:
+  schedule:
+    - cron: '13 * * * *'
+  workflow_dispatch:
+
+# CRITICAL: Gives the action permission to push the index.html back to the repo
+permissions:
+  contents: write
+
+# The pipeline got longer when the PSU BUFKIT stage was slowed to 2 concurrent connections,
+# and longer again on an ECMWF ENS / GEFS cycle change. Without this, a run that overruns the
+# hour has a second run pushing to main underneath it — which is the race the `git pull
+# --rebase` at the bottom was papering over. cancel-in-progress stays false so a run that is
+# mid-fetch is never killed partway through writing history.json.
+concurrency:
+  group: taf-dashboard-update-vbg
+  cancel-in-progress: false
+
+jobs:
+  update-dashboard:
+    runs-on: ubuntu-latest
+    # Default is 6 hours. A hung fetch on a dead endpoint would otherwise burn Actions
+    # minutes until someone noticed; a normal run is well under 20 minutes even on a
+    # cycle change, so 60 is generous without being open-ended.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # OPTIMIZATION: Caches your requirements to save time/minutes
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update --fix-missing
+          # libaec-dev provides CCSDS (AEC) decompression, which eccodes/pygrib needs to read
+          # ECMWF Open Data GRIB2 (CCSDS-packed since July 2023). Without it the ECMWF column
+          # decodes to zero fields (the [ECMWF DEBUG] log will flag it).
+          sudo apt-get install -y libeccodes-dev libaec-dev libgeos-dev libproj-dev proj-bin
+
+      - name: Install Libraries
+        run: |
+          pip install -r requirements.txt
+          # ECMWF Open Data client (installed explicitly so the ECMWF column works even if it
+          # hasn't been added to requirements.txt yet).
+          pip install ecmwf-opendata
+
+      - name: Pre-run diagnostics
+        run: |
+          echo "Free disk:"; df -h / | tail -1
+          echo "Repo .git size: $(du -sh .git 2>/dev/null | cut -f1)"
+          python -c "import metpy, pygrib, cartopy; print('metpy/pygrib/cartopy import OK')" \
+            || echo "WARNING: a core library failed to import - see the pipeline log below"
+
+      - name: Run Script
+        run: |
+          # pipefail so the job fails on a pipeline error rather than on tee's exit code.
+          set -o pipefail
+          python aviation_dashboard.py 2>&1 | tee run.log
+
+      - name: Post-run diagnostics
+        # Runs even on failure, so a crashed pipeline still reports what it managed to write.
+        if: always()
+        run: |
+          echo "Free disk after run:"; df -h / | tail -1
+          echo "--- outputs ---"
+          ls -la history.json soundings.json 2>/dev/null || echo "one or more JSON outputs missing"
+          echo "maps/: $(ls maps/ 2>/dev/null | wc -l) file(s)"
+          echo "--- key pipeline lines ---"
+          # Surface the summary lines that say whether each data source actually worked.
+          grep -E "BUFKIT:|carried forward|Skew-T export|GEFS thermo:|ECMWF ENS|ECMWF column|AWS columns merged|Launch thermo:|not caching" run.log \
+            | tail -25 || echo "(no summary lines matched)"
+          # FIRST-RUN CHECK FOR THIS DOMAIN. The Western Range BUFKIT station ids were never
+          # probed against PSU -- see BUFKIT_ID_OVERRIDES in aviation_dashboard.py. A station
+          # PSU does not publish 404s, which degrades to a blank/carried-forward column rather
+          # than failing the run, so it is invisible unless you look. These lines name it.
+          echo "--- BUFKIT per-station ---"
+          grep -E "BUFKIT|bufkit|\\.buf" run.log | tail -30 || echo "(no BUFKIT lines)"
+          echo "--- IVT ---"
+          # IVT gets its own block: the per-step warnings name the HTTP status that caused a
+          # model to be abandoned, and they are the only record of WHY a model produced no
+          # maps. Without this they were written to run.log and then discarded on success.
+          grep -E "\[IVT\]" run.log | tail -40 || echo "(no IVT lines)"
+          echo "--- errors ---"
+          grep -E "ERROR|Traceback" run.log | head -20 || echo "(none)"
+
+      # ALWAYS keep the log, not just on failure. A run can "succeed" while a whole data
+      # source produced nothing -- the IVT models were abandoned on three separate successful
+      # runs and the log explaining why was thrown away each time, because the pipeline
+      # degrades rather than crashing. Partial failure is the interesting case.
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_number }}
+          path: run.log
+          retention-days: 14
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+
+          # Stage the generated maps/ folder along with the dashboard + history, otherwise the
+          # spatial-plot PNGs never make it into the repo. `git add maps/` also stages
+          # DELETIONS, so PNGs the pipeline pruned are removed from the repo too.
+          #
+          # Each path is staged only if it exists. `git add` on a missing pathspec is a fatal
+          # error (exit 128), which would fail this step for a reason unrelated to the actual
+          # run -- and mask whatever the pipeline really did. soundings.json in particular is
+          # only written by builds that include the Skew-T panel, so it is genuinely optional.
+          for f in index.html history.json soundings.json; do
+            if [ -e "$f" ]; then git add "$f"; fi
+          done
+          if [ -d maps ]; then git add maps/; fi
+
+          # Distinguish "nothing changed" from "commit actually failed". The old
+          # `git commit || exit 0` treated a genuine commit error as success, which would
+          # silently skip the push and leave the dashboard frozen with no failed run to notice.
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update Dashboard and History $(date -u)"
+
+          # Retry the rebase+push. Even with the concurrency group, a manual workflow_dispatch
+          # can land alongside the scheduled run; one lost race should not fail the job.
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying in 10s."
+            sleep 10
+          done
+          echo "All push attempts failed."
+          exit 1
