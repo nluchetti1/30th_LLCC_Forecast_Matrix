@@ -1,0 +1,17 @@
+# Scratch space the pipeline downloads GRIB2 into and purges at the start of every run.
+# Individual files can be tens of MB; on a GEFS or ECMWF ENS cycle change the directory
+# churns through a couple of gigabytes. It must never be committed.
+workspace_cache/
+
+# Pipeline run log, captured by the workflow and uploaded as an artifact on failure.
+run.log
+
+# Local scratch
+*.grib2
+*.grib2.idx
+*.buf
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/

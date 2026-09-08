@@ -1,0 +1,11 @@
+requests
+numpy
+pandas
+xarray
+cfgrib
+jinja2
+metpy
+dask
+pygrib
+cartopy
+ecmwf-opendata
