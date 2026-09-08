@@ -78,8 +78,17 @@ jobs:
             [ -d "$d" ] && echo "$d: $(ls "$d" | wc -l) file(s)"
           done
 
+      # continue-on-error, and `if: always()` on the push below.
+      #
+      # WHY: on 2026-09-08 this step failed at FinalizeArtifact with a non-retryable 403 AFTER
+      # the bytes had uploaded successfully. Because "Commit and Push" had no `if:` condition,
+      # a failure here SKIPPED it -- the pipeline had already run to completion and built the
+      # dashboard, and then the result was thrown away because a diagnostic upload could not
+      # be finalised. The log artifact is a convenience; the commit is the product. A flaky
+      # artifact service must never be able to block it again.
       - name: Upload run log
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ivt-log-${{ github.run_number }}
@@ -87,6 +96,8 @@ jobs:
           retention-days: 14
 
       - name: Commit and Push
+        # See the note on the upload step: a failed artifact upload must not skip the push.
+        if: always()
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
