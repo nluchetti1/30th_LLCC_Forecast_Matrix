@@ -69,14 +69,22 @@ _BUFKIT_GATE = threading.Semaphore(BUFKIT_MAX_CONCURRENCY)
 
 # PSU names most BUFKIT files after the 4-character ICAO id ("gfs3_kvbg.buf"), but not all:
 # the Cape build needed kxmr -> "xmr" because XMR is carried in the BUFR station list without
-# its leading K. Any Western Range site that turns out to be filed under a different id goes
-# here rather than into a special case inside fetch_station_model.
+# its leading K.
 #
-# UNVERIFIED FOR THIS DOMAIN. A station PSU does not publish returns 404, which the pipeline
-# already treats as a soft failure -- the column carries forward or renders blank, the run
-# does not fail. The "BUFKIT:" summary line in run.log names every station that came back
-# empty; check it after the first run and add overrides (or drop sites) from what it says.
-BUFKIT_ID_OVERRIDES = {}
+# KEYED BY (station, model), NOT BY STATION. That shape is forced by what the first live run
+# found: kvbg/gfs returns 200 while kvbg/rap and kvbg/hrrr both return 404. PSU builds each
+# model's BUFKIT set from that model's own BUFR station list, and those lists differ -- the
+# GFS list is large and general, the RAP/HRRR lists come from the smaller mesoscale station
+# table. So a station can be present under one model and absent under another, and a
+# station-keyed override would have to break a working GFS column to fix a broken RAP one.
+#
+# A None value means "PSU does not carry this station for this model, do not ask" -- it skips
+# the request entirely rather than spending a round trip on a known 404 against a server that
+# is already rate-limiting us. The coarse-GRIB fallback fills the column either way.
+BUFKIT_ID_OVERRIDES = {
+    # ("kvbg", "rap"): None,     # confirmed 404 on 2026-09-08; uncomment to stop asking
+    # ("kvbg", "hrrr"): None,    # confirmed 404 on 2026-09-08; uncomment to stop asking
+}
 
 # ---- ECMWF Open Data (IFS HRES 0.25°, CC-BY-4.0) additive global column ----
 ECMWF_ENABLED = True
@@ -2163,7 +2171,16 @@ def fetch_station_model(session, stn, model):
     wasn't posted; run_pipeline will try to carry the previous run's column forward rather
     than render a blank column.
     """
-    download_id = BUFKIT_ID_OVERRIDES.get(stn, stn)
+    # Per (station, model); falls back to a station-wide entry, then to the id itself.
+    if (stn, model) in BUFKIT_ID_OVERRIDES:
+        download_id = BUFKIT_ID_OVERRIDES[(stn, model)]
+    else:
+        download_id = BUFKIT_ID_OVERRIDES.get(stn, stn)
+    if download_id is None:
+        # Known-absent station for this model. Not an error: the coarse-GRIB fallback owns
+        # this column, and skipping the request keeps a guaranteed 404 out of the rate limit.
+        logging.info(f"BUFKIT {stn}/{model}: skipped (marked absent in BUFKIT_ID_OVERRIDES).")
+        return stn, model, {}
     model_prefix = "gfs3" if model == "gfs" else model
     # https, not http: PSU redirects anyway, and the redirect costs an extra round trip
     # against a server that is already rate-limiting us.
@@ -2254,7 +2271,10 @@ def carry_forward_missing(sounding_matrix, models_to_check=None):
     the run it came from, which the frontend surfaces as a stale marker.
 
     A carried BUFKIT column is a genuinely older forecast, not a nowcast: treat it as the
-    last known good run, and note that RRFS/REFS/ECMWF in the same row are current."""
+    last known good run, and note that RRFS/REFS/ECMWF in the same row are current.
+
+    Only true BUFKIT rows are eligible; rows that were themselves a coarse GRIB fallback are
+    skipped, so they can be rebuilt fresh rather than ageing in place (see below)."""
     prior, ts = _prior_run_station_data()
     if not prior:
         return 0
@@ -2267,10 +2287,29 @@ def carry_forward_missing(sounding_matrix, models_to_check=None):
             old = ((prior.get(stn) or {}).get(mdl)) or {}
             carried = {}
             for rk, prof in old.items():
-                if isinstance(prof, dict) and _row_is_future(rk, now_utc):
-                    p = dict(prof)
-                    p["stale"] = p.get("stale") or ts or "a previous run"
-                    carried[rk] = p
+                if not (isinstance(prof, dict) and _row_is_future(rk, now_utc)):
+                    continue
+                # NEVER carry forward a column that was itself a coarse GRIB fallback.
+                #
+                # Without this the two degradation paths feed each other into a ratchet. A
+                # station PSU does not publish gets a fresh coarse column on run 1, which is
+                # then written to history.json. On run 2 carry-forward finds those rows,
+                # copies them, and stamps `stale` on top of the `coarse` they already carry --
+                # which makes the column non-empty, so _merge_coarse_fallback declines to
+                # touch it and the FRESH coarse column built this run is thrown away. The
+                # result is a column that is both stale and coarse when a merely-coarse one
+                # was available, ageing further every hour until the rows fall out of the
+                # future window.
+                #
+                # Carry-forward exists to rescue a column with no other source. A coarse
+                # column always has another source -- the GRIB path rebuilds it every run --
+                # so leaving it empty here is what lets the fallback refill it with current
+                # data a few steps later in run_pipeline.
+                if prof.get("coarse"):
+                    continue
+                p = dict(prof)
+                p["stale"] = p.get("stale") or ts or "a previous run"
+                carried[rk] = p
             if carried:
                 mdls[mdl] = carried
                 filled += 1
@@ -2307,11 +2346,16 @@ def _nomads_grib_url(model, date_str, cycle, f_hour_int):
     surface pressure over a small Vandenberg bounding box (keeps downloads tiny)."""
     lev_params = "".join(f"&lev_{lv}_mb=on" for lv in PAD_LEVELS_HPA)
     var_params = "&var_TMP=on&var_RH=on&var_HGT=on&var_UGRD=on&var_VGRD=on&var_PRES=on"
-    # Spans North Base (KVGN, 34.85N) through the southern complexes (SLC-14, 34.56N) with
-    # ~0.15 deg of margin on each side, so every LAUNCH_PADS entry has real grid cells around
-    # it rather than sitting on the edge of the subset. Widen this if pads are added outside
-    # 34.4-35.0N / 121.0-120.2W, or the nearest-gridpoint search will snap to the boundary.
-    region = "&subregion=&leftlon=-121.0&rightlon=-120.2&toplat=35.0&bottomlat=34.4"
+    # Covers every point in grib_extract_points(), not just the pads: the northern edge
+    # clears KSBP (35.24N), the southern and eastern clear San Nicolas Island (33.24N,
+    # 119.46W), and there is ~0.2 deg of margin all round so no site's nearest-gridpoint
+    # search snaps to the boundary. This is wider than the pads alone need, because the
+    # airports are extracted from the same file as fallback columns.
+    #
+    # The extra area is nearly free at these resolutions -- RAP's 13 km grid puts roughly 300
+    # cells in this box against ~35 in the pads-only box, and both are trivial next to the
+    # per-message overhead. Widen it further if a site is added outside these bounds.
+    region = "&subregion=&leftlon=-121.4&rightlon=-119.1&toplat=35.5&bottomlat=33.0"
 
     if model == "hrrr":
         # Use the pressure-level HRRR filter (filter_hrrr_2d.pl is SURFACE fields only and
@@ -2481,7 +2525,7 @@ def fetch_pad_model(session, model, date_str, cycle, f_hour_int, row_key, debug=
             sz = os.path.getsize(local_path) if os.path.exists(local_path) else 0
             logging.info(f"[PAD DEBUG]   downloaded {sz} bytes")
 
-        pad_profiles = build_pad_profiles_from_grib(local_path, LAUNCH_PADS, debug=debug)
+        pad_profiles = build_pad_profiles_from_grib(local_path, grib_extract_points(), debug=debug)
         for pid, layers in pad_profiles.items():
             result = compute_profile_variables(layers)
             if result is not None:
@@ -2534,11 +2578,59 @@ def determine_model_cycle(session, model):
     return None, None
 
 
+def grib_extract_points():
+    """Every point the raw-GRIB path extracts a column at: the pads AND the BUFKIT airports.
+
+    The airports are in here for the FALLBACK, not for routine use. When PSU serves a real
+    BUFKIT sounding for a station, that column wins and the GRIB column built here is
+    discarded unused -- see _merge_coarse_fallback. The cost of carrying them is close to
+    zero, because these are extra nearest-gridpoint reads out of a GRIB file that has
+    already been downloaded and opened; it is the download, not the extraction, that costs
+    anything. What it buys is that a station PSU does not publish degrades to a coarse
+    column instead of a blank one.
+    """
+    pts = {}
+    for pid, c in LAUNCH_PADS.items():
+        pts[pid] = {"lat": c["lat"], "lon": c["lon"]}
+    for sid, c in STN_COORDS.items():
+        pts[sid] = {"lat": c["lat"], "lon": c["lon"]}
+    return pts
+
+
+def _merge_coarse_fallback(target, sid, model, rows, label):
+    """Install a mandatory-level GRIB column ONLY where no BUFKIT column arrived.
+
+    Every coarse column in the dashboard goes through here, so the rule that decides when a
+    fallback is allowed exists in exactly one place. The rule is per (station, model) and is
+    evaluated against THIS run: if PSU served the sounding, the BUFKIT column stands and this
+    is a no-op.
+
+    `coarse` is what the frontend keys the dotted-violet underline and the tooltip off, so a
+    column that comes through here can never pass as a BUFKIT-quality number.
+    """
+    if not rows:
+        return False
+    if target.get(sid, {}).get(model):
+        return False                     # real BUFKIT column arrived this run; leave it alone
+    target.setdefault(sid, {})[model] = {
+        rk: dict(p, coarse=label) for rk, p in rows.items() if isinstance(p, dict)
+    }
+    return True
+
+
+# RAP cycles that run past the usual 21 h. The others stop at f021, and asking beyond that
+# returns 404s that look like a fetch failure in the summary line but are the run length.
+RAP_EXTENDED_CYCLES = {3, 9, 15, 21}
+
+
 def fetch_all_pad_soundings():
     """Build the pad sounding matrix {pad_id: {model: {row_key: variables}}} from NOMADS.
     GFS and RAP are pulled here via the NOMADS grib-filter; HRRR is intentionally skipped
     (its NOMADS filter probe was unreliable) and instead sourced from AWS in the RRFS pass."""
-    pad_matrix = {pid: {m: {} for m in MODELS} for pid in LAUNCH_PADS}
+    # Keyed over pads AND airports; the caller splits them (see run_pipeline). Airport
+    # entries are candidates for _merge_coarse_fallback and are dropped if unused.
+    points = grib_extract_points()
+    pad_matrix = {pid: {m: {} for m in MODELS} for pid in points}
     nomads_models = [m for m in BUFKIT_MODELS if m != "hrrr"]  # gfs, rap (HRRR + ECMWF fetched elsewhere)
 
     with requests.Session() as session:
@@ -2553,11 +2645,25 @@ def fetch_all_pad_soundings():
             # native output through f120 on NOMADS (3-hourly only kicks in after f120),
             # so within 48h we get a full hourly series that matches the BUFKIT airports
             # and avoids sparse every-third-row gaps in the merged table.
-            max_fh = 48
+            # GFS runs to 48 here; RAP does not. RAP's awp130pgrb goes to f021 on most
+            # cycles and only the 03/09/15/21Z runs extend to f051, so a flat 48 fired 27
+            # doomed requests an hour at NOMADS -- visible in the log as "RAP pad soundings:
+            # 21/48 forecast hours produced data", which reads like a partial failure but is
+            # just the RUN LENGTH. Asking for what exists makes the summary line honest and
+            # stops the wasted round trips.
+            if model == "rap":
+                max_fh = 51 if int(cycle) in RAP_EXTENDED_CYCLES else 21
+            else:
+                max_fh = 48
             step = 1
             f_hours = list(range(step, max_fh + 1, step))
 
             logging.info(f"Fetching {model.upper()} pad columns: {date_str} {cycle}z, {len(f_hours)} hours")
+            # Only the pads get their cycle recorded here. An airport's (site, model) cycle
+            # label belongs to whichever column actually ends up displayed, and that is not
+            # known until the BUFKIT results are in -- recording it now would stamp the GRIB
+            # cycle onto a column that may well be served from a BUFKIT sounding on a
+            # different cycle. run_pipeline records it if and only if the fallback is used.
             for _pid in LAUNCH_PADS:
                 _record_cycle(_pid, model, f"{date_str}{cycle}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
@@ -5874,13 +5980,42 @@ def run_pipeline():
         time_rows = trimmed_rows
 
     # Fetch launch-pad soundings from raw GRIB2 (additive; independent of BUFKIT stations).
+    # The same pass also extracts columns at the AIRPORT points, which are held aside as
+    # fallback candidates and merged below only where BUFKIT came back empty.
+    grib_airport_matrix = {}
     try:
         pad_matrix = fetch_all_pad_soundings()
+        for _sid in [s for s in pad_matrix if s not in LAUNCH_PADS]:
+            grib_airport_matrix[_sid] = pad_matrix.pop(_sid)
         pad_hours = sum(len(m.get("hrrr", {})) for m in pad_matrix.values())
         logging.info(f"Launch-pad soundings assembled ({pad_hours} HRRR pad-hours across {len(pad_matrix)} pads).")
     except Exception as e:
         logging.error(f"Launch-pad sounding fetch failed, continuing without pads: {e}")
         pad_matrix = None
+
+    # Coarse-GRIB fallback for the NOMADS models (GFS, RAP). Before this existed the fallback
+    # covered HRRR only, so a station PSU does not publish showed a violet HRRR column beside a
+    # completely EMPTY RAP column -- same root cause, two different symptoms, and the empty one
+    # looked like a broken fetch rather than a missing station. Both now degrade the same way.
+    if grib_airport_matrix:
+        _fb = []
+        for _sid, _models in grib_airport_matrix.items():
+            for _mdl, _rows in (_models or {}).items():
+                if _merge_coarse_fallback(sounding_matrix, _sid, _mdl,
+                                          _rows, f"NOMADS {_mdl.upper()} (isobaric levels)"):
+                    _fb.append(f"{_sid.upper()}/{_mdl}")
+                    _ck = _MODEL_CYCLES.get((next(iter(LAUNCH_PADS), ""), _mdl))
+                    if _ck:
+                        _record_cycle(_sid, _mdl, _ck)
+        if _fb:
+            logging.info(f"BUFKIT: coarse GRIB fallback used for {len(_fb)} column(s): "
+                         f"{', '.join(sorted(_fb))}. These stations returned no BUFKIT sounding "
+                         f"this run -- check the per-station BUFKIT lines above for the HTTP "
+                         f"status. A 404 on some models but not others means PSU does not "
+                         f"carry that station on those models' BUFR lists -- mark them "
+                         f"absent in BUFKIT_ID_OVERRIDES to stop asking.")
+        else:
+            logging.info("BUFKIT: no coarse GRIB fallback needed for the NOMADS columns.")
 
     # Fetch RRFS + REFS + HRRR columns from AWS (single idx-based pass). RRFS/REFS are
     # point-extracted for BOTH pads and airports; AWS HRRR is applied to PADS ONLY (the
@@ -5898,20 +6033,23 @@ def run_pipeline():
                     if not rows:
                         continue
                     # AWS HRRR normally fills pad columns only, because the airports have
-                    # richer ~40-level BUFKIT HRRR soundings. When BUFKIT is unavailable
-                    # (PSU closed public access to the archive in Aug 2026), an airport HRRR
-                    # column would otherwise sit empty once carry-forward ages out — so fall
-                    # back to the AWS column rather than showing nothing. Mandatory isobaric
-                    # levels give only 2-3 points below 2,000 ft, so LLWS on a fallback column
-                    # is the same bulk estimate the pads use; it is tagged so the frontend can
-                    # say so rather than letting it pass as a BUFKIT-quality number.
+                    # richer ~40-level BUFKIT HRRR soundings. Where a station's BUFKIT column
+                    # is missing this run, fall back to the AWS column rather than showing
+                    # nothing. Mandatory isobaric levels give only 2-3 points below 2,000 ft,
+                    # so LLWS on a fallback column is the same bulk estimate the pads use.
+                    #
+                    # NOTE ON WHAT THIS DOES *NOT* TEST. The condition is per station and per
+                    # run -- "did a BUFKIT column arrive for this site?" -- and nothing here
+                    # checks whether PSU is reachable. A single violet column therefore means
+                    # THIS STATION was missing, not that the archive is down; PSU serving
+                    # other stations happily is entirely consistent with it.
                     if kind == "hrrr" and not is_pad:
-                        if target[sid].get("hrrr"):
-                            continue  # a real BUFKIT column arrived this run; don't clobber it
-                        rows = {rk: dict(p, coarse="AWS HRRR (isobaric levels)")
-                                for rk, p in rows.items() if isinstance(p, dict)}
-                        logging.info(f"HRRR {sid}: no BUFKIT column, using AWS isobaric fallback "
-                                     f"({len(rows)} hours).")
+                        if _merge_coarse_fallback(target, sid, "hrrr", rows,
+                                                  "AWS HRRR (isobaric levels)"):
+                            logging.info(f"BUFKIT: coarse GRIB fallback used for "
+                                         f"{sid.upper()}/hrrr — no BUFKIT column this run "
+                                         f"({len(rows)} hours from AWS isobaric).")
+                        continue
                     target[sid][kind] = rows
             r_hours = sum(len(k.get("rrfs", {})) for k in aws_matrix.values())
             e_hours = sum(len(k.get("refs", {})) for k in aws_matrix.values())
